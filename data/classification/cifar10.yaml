@@ -1,0 +1,45 @@
+dataset:
+  train:
+    type: torchvision.datasets.CIFAR10
+    args:
+      train: True
+    num_workers: 2
+    augment:
+      A.HorizontalFlip:
+        p: 0.5
+      A.Rotate:
+        limit: [-10, 10]
+
+  valid:
+    type: torchvision.datasets.CIFAR10
+    args:
+      train: False
+    num_workers: 2
+
+model:
+  type: BasicModel
+  import_from: train_app.models.classification.basic_model
+
+  checkpoints:
+    every_n_epochs: 2
+    save_top_k: -1
+    verbose: True
+
+loss:
+  type: CrossEntropyLoss
+
+metrics:
+  - metric:
+      type: Accuracy
+
+hypes:
+  batch_size: 128
+  epochs: 100
+  lr: 0.001
+
+hardware:
+  accelerator: gpu
+  devices: -1
+
+loggers:
+  wandb:

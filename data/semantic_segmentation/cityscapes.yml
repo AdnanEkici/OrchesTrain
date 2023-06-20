@@ -1,0 +1,42 @@
+dataset:
+  train:
+    type: CityScapesDataset
+    num_workers: 6
+    image_sz: &image_sz [1024, 512]
+    root_path: cityscapes/gtFine_trainvaltest/gtFine/train
+    augment:
+      A.HorizontalFlip:
+        p: 0.5
+  valid:
+    type: CityScapesDataset
+    num_workers: 6
+    image_sz: *image_sz
+    root_path: cityscapes/gtFine_trainvaltest/gtFine/val
+
+model:
+  type: UNet
+  import_from: train_app.models.semantic_segmentation.unet
+
+  args:
+    in_channels: 3
+    out_channels: 20
+
+losses:
+  - loss:
+      type: CrossEntropyLoss
+      weights: 1
+
+metric:
+  type: CrossEntropyLoss
+
+hypes:
+  batch_size: 6
+  epochs: 100
+  lr: 0.001
+
+hardware:
+  accelerator: gpu
+  devices: -1
+
+loggers:
+  wandb:
