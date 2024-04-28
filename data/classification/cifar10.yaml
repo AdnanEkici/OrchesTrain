@@ -3,7 +3,7 @@ dataset:
     type: torchvision.datasets.CIFAR10
     args:
       train: True
-    num_workers: 2
+    num_workers: 8
     augment:
       A.HorizontalFlip:
         p: 0.5
@@ -14,13 +14,13 @@ dataset:
     type: torchvision.datasets.CIFAR10
     args:
       train: False
-    num_workers: 2
+    num_workers: 8
 
 model:
   type: BasicModel
-  import_from: train_app.models.classification.basic_model
 
-  checkpoints:
+callbacks:
+  ModelCheckpoint:
     every_n_epochs: 2
     save_top_k: -1
     verbose: True
@@ -31,15 +31,34 @@ loss:
 metrics:
   - metric:
       type: Accuracy
+  - metric:
+      type: F1
+      args:
+        n_classes: 10
+  - metric:
+      type: ClassAccuracy
+      args:
+        n_classes: 10
 
 hypes:
-  batch_size: 128
+  batch_size: 512
   epochs: 100
   lr: 0.001
 
+optimizers:
+  AdamW:
+    scheduler:
+      type: ReduceLROnPlateau
+      args:
+        patience: 300
+        factor: 0.05
+        min_lr: 0.00002
+        verbose: True
+      monitor: validation/loss
+
 hardware:
   accelerator: gpu
-  devices: -1
+  devices: [0]
 
 loggers:
-  wandb:
+  tensorboard:

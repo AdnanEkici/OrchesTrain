@@ -5,6 +5,7 @@ import sys
 import fire
 import scripts.train as train
 from scripts.converter import model_jit_converter
+from scripts.render import renderer_fn
 
 from orchestrain.version import VERSION
 
@@ -14,7 +15,7 @@ def show_version():
     print(VERSION)
 
 
-app = {"version": show_version, "convert": model_jit_converter, **train.fire_train_type_selector}
+app = {"version": show_version, "render": renderer_fn, "convert": model_jit_converter, **train.fire_train_type_selector}
 
 
 def main(args=None):

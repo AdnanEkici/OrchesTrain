@@ -19,6 +19,14 @@ def convert_for_double_input_trainer(model, out_path, image_sizes):
     print(utils.TerminalColors.GREEN + f"Model saved to {out_path}" + utils.TerminalColors.END)
 
 
+def convert_for_telemetrynet(model, out_path, image_sizes):
+    dummy_input = torch.rand(1, 1, image_sizes[0], image_sizes[1])
+    traced_script_module = torch.jit.trace(model, dummy_input)
+    traced_script_module.save(out_path)
+
+    print(utils.TerminalColors.GREEN + f"Model saved to {out_path}" + utils.TerminalColors.END)
+
+
 def model_jit_converter(models: list[str], data: str = "", out: str = "", img_size: tuple[int, int] = (1920, 1072)):
     """Converts the torch models to torch script
 
@@ -51,7 +59,10 @@ def model_jit_converter(models: list[str], data: str = "", out: str = "", img_si
             print(utils.TerminalColors.RED + f"File exists: {out_dir}! Weight will be updated." + utils.TerminalColors.END)
 
         try:
-            convert_for_double_input_trainer(model, out_dir, img_size)
+            if "TelemetryModel" in config["model"]["type"]:
+                convert_for_telemetrynet(model, out_dir, img_size)
+            else:
+                convert_for_double_input_trainer(model, out_dir, img_size)
         except Exception as e:
             print(utils.TerminalColors.RED + f"Error converting model: {model_path}. Error: {str(e)}" + utils.TerminalColors.END)
 

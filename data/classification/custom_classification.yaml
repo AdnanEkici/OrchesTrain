@@ -20,9 +20,9 @@ dataset:
 
 model:
   type: BasicModel
-  import_from: train_app.models.classification.basic_model
 
-  checkpoints:
+callbacks:
+  ModelCheckpoint:
     every_n_epochs: 2
     save_top_k: -1
     verbose: True
@@ -38,6 +38,17 @@ hypes:
   batch_size: 128
   epochs: 100
   lr: 0.001
+
+optimizers:
+  AdamW:
+    scheduler:
+      type: ReduceLROnPlateau
+      args:
+        patience: 300
+        factor: 0.05
+        min_lr: 0.00002
+        verbose: True
+      monitor: validation/loss
 
 hardware:
   accelerator: gpu
