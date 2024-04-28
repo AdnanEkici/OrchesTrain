@@ -13,35 +13,35 @@ import torch
 import wandb
 import yaml
 from dotty_dict import dotty
-from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import MLFlowLogger
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.loggers import WandbLogger
 
 import orchestrain.dataset as dataset  # noqa
+import orchestrain.models as models  # noqa
 import orchestrain.utils as utils
 from orchestrain.models.base import ModelBase
 
 # from pytorch_lightning.strategies.ddp_spawn import DDPSpawnStrategy
 
-os.system(f"export PYTHONPATH={os.path.dirname(os.path.abspath(__file__)) + '/../..'}")
+os.system(f"export PYTHONPATH={os.path.dirname(os.path.abspath(__file__)) + os.sep + '..'+ os.sep + '..'}")
 
 
 class Trainer:
-    """Training precedure start with config yaml
+    """Training procedure start with config yaml
 
     Parameters
     ----------
     project : str
-        _description_
+        Name of the project.
     data : str | dict
-        _description_
-    logger : Trainer.LoggerType, optional
-        _description_, by default LoggerType.TENSORBOARD
+        File path of the config YAML or a dictionary that includes the configurations in the same format as expected in YAML file.
+    logger : Trainer.LoggerType or str, optional
+        Class of the logger will be used in training, by default LoggerType.TENSORBOARD.
     visualize : bool, optional
-        _description_, by default False
-    type : str, optional
-        _description_, by default "train"
+        Whether to visualize training data locally during training or not, by default False.
+    start_process : bool, optional
+        Whether to start training after initialization or not, by default True.
 
     Returns
     -------
@@ -81,10 +81,12 @@ class Trainer:
         self.is_visualize = visualize
         self.train_type: Trainer.TrainType = Trainer.TrainType.TRAIN if "train_type" not in dir(self) else self.train_type
         self.file_path = os.path.dirname(os.path.realpath(__file__))
-        self.module_dir = os.path.join(self.file_path, "../../train_app")
+        self.module_dir = os.path.join(self.file_path, ".." + os.sep + ".." + os.sep + "train_app")
         self.loggers = []  # type: list[object]
         self.config_file_name = os.path.basename(data) if isinstance(data, str) else "auto_generated_config.yml"
         self.config_data = data if isinstance(data, dict) else utils.read_yaml(data)
+
+        pl.seed_everything(1)
 
         # prepare run directory
         self.__run_path()
@@ -98,8 +100,9 @@ class Trainer:
         self.dataset_conf = self.config["dataset"]
         self.hypes = self.config["hypes"]
         self.hardware = self.config["hardware"]
-        self.callbacks = [ModelCheckpoint(**self.config["model"]["checkpoints"], monitor="validation/loss", save_weights_only=True)]
 
+        # set callbacks
+        self.callbacks = self.__generate_callbacks(self.config["callbacks"])
         # Create datasets
         self.__data_loader()
         # correct the config with start model
@@ -114,14 +117,14 @@ class Trainer:
             max_epochs=self.hypes["epochs"],
             callbacks=self.callbacks,
             logger=self.loggers,
-            # deterministic eğitimlerin aynı olmasını sağlıyor, eğitimi yavaşlatır
+            # deterministic keeps the trainings same, slows down the training.
             # deterministic=False,
-            strategy="ddp_spawn",
+            strategy="ddp",
             devices=self.hardware["devices"],
             accelerator=self.hardware["accelerator"],
             # num_nodes=2
             # auto_select_gpus=True,
-            # log_every_n_steps=1,
+            log_every_n_steps=5,
         )
 
         if start_process:
@@ -142,11 +145,12 @@ class Trainer:
         """
         self.pl_trainer.fit(self.model, self.train_dataloader, self.val_data_loader)
 
-        if hasattr(self, "test_dataloader"):
-            self.pl_trainer.test(dataloaders=self.test_dataloader, ckpt_path="best")
-
         print(f"best model path: {self.pl_trainer.checkpoint_callback.best_model_path}")
         print(f"best model score: {self.pl_trainer.checkpoint_callback.best_model_score}")
+
+        if self.test_dataloader:
+            self.pl_trainer.test(dataloaders=self.test_dataloader, ckpt_path=self.pl_trainer.checkpoint_callback.best_model_path)
+
         # TODO: print last bests
 
     def __del__(self):
@@ -182,19 +186,20 @@ class Trainer:
                 batch_size=self.hypes["batch_size"],
                 num_workers=self.dataset_conf[task_type]["num_workers"],
                 shuffle=task_type == "train",
-                persistent_workers=True,
                 collate_fn=eval(self.dataset_conf[task_type]["collate_fn"]) if "collate_fn" in self.dataset_conf[task_type] else None,
             )
             return data_loader, _dataset
 
-        if "valid" in self.dataset_conf.keys():
-            self.val_data_loader, self.val_dataset = create_dataloader("valid")
+        self.train_dataloader = self.val_data_loader = self.test_dataloader = None
 
         if self.train_type == Trainer.TrainType.TRAIN:
             self.train_dataloader, self.train_dataset = create_dataloader("train")
 
-            if "test" in self.dataset_conf.keys():
-                self.test_dataloader, self.test_dataset = create_dataloader("test")
+        if "valid" in self.dataset_conf.keys():
+            self.val_data_loader, self.val_dataset = create_dataloader("valid")
+
+        if "test" in self.dataset_conf.keys():
+            self.test_dataloader, self.test_dataset = create_dataloader("test")
 
     def __run_path(self):
         """Private method to prepare the run path and save necessary files.
@@ -231,16 +236,11 @@ class Trainer:
             The default configuration dictionary.
 
         """
-        default_num_workers = 6
 
         config = {}  # type: dict
         config["model"] = {}  # type: dict
         config["dataset"] = {}  # type: dict
-        config["dataset"]["train"] = {}  # type: dict
-        config["dataset"]["train"]["num_workers"] = default_num_workers
-        config["dataset"]["valid"] = {}  # type: dict
-        config["dataset"]["valid"]["num_workers"] = default_num_workers
-        config["model"]["checkpoints"] = {"every_n_epochs": 2, "save_top_k": -1, "dirpath": self.run_path + "weights/", "verbose": True}
+        config["callbacks"] = {"ModelCheckpoint": {"dirpath": self.run_path + "weights/"}}
         config["hypes"] = {"batch_size": 1, "epochs": 1, "lr": 0.0001}
         config["hardware"] = {"accelerator": "gpu", "devices": -1}
 
@@ -302,28 +302,28 @@ class Trainer:
 
         if "wandb" in self.config["loggers"]:
             self.wandb_logger = WandbLogger(project=self.project, log_model="all", config=hypes)
+            if pl.utilities.rank_zero_only.rank == 0:
+                # sync the configs
+                config_tmp = dotty(self.config)
+                wandb_config = dict(self.wandb_logger.experiment.config)
+                for key in wandb_config:
+                    if key in config_tmp:
+                        config_tmp[key] = wandb_config[key]
+                    if "." not in key:
+                        hypes[key] = wandb_config[key]
+                self.config = config_tmp.to_dict()
+                self.wandb_logger.experiment.config.update(hypes)
 
-            # sync the configs
-            config_tmp = dotty(self.config)
-            wandb_config = dict(self.wandb_logger.experiment.config)
-            for key in wandb_config:
-                if key in config_tmp:
-                    config_tmp[key] = wandb_config[key]
-                if "." not in key:
-                    hypes[key] = wandb_config[key]
-            self.config = config_tmp.to_dict()
-            self.wandb_logger.experiment.config.update(hypes)
+                # copy the code to the wandb and remove __pycache__ if exists
+                wandb_save_dir = "code/train_app"  # TODO : add os.sep or path.join
 
-            # copy the code to the wandb and remove __pycache__ if exists
-            wandb_save_dir = "code/train_app"  # TODO : add os.sep or path.join
-
-            wandb_save_path = os.path.join(wandb.run.dir, wandb_save_dir)
-            clean_save_path(wandb_save_path)
-            # copy configs
-            with open(os.path.join(wandb.run.dir, "args_config.yml"), "w") as f:
-                f.write(yaml.dump(self.config_data, indent=4))
-            with open(os.path.join(wandb.run.dir, "app_config.yml"), "w") as f:
-                f.write(yaml.dump(self.config, indent=4))
+                wandb_save_path = os.path.join(wandb.run.dir, wandb_save_dir)
+                clean_save_path(wandb_save_path)
+                # copy configs
+                with open(os.path.join(wandb.run.dir, "args_config.yml"), "w") as f:
+                    f.write(yaml.dump(self.config_data, indent=4))
+                with open(os.path.join(wandb.run.dir, "app_config.yml"), "w") as f:
+                    f.write(yaml.dump(self.config, indent=4))
 
             self.loggers.append(self.wandb_logger)
 
@@ -336,22 +336,38 @@ class Trainer:
                 tracking_uri=mlflow_config["tracking_uri"],
                 log_model="all",
             )
+            if pl.utilities.rank_zero_only.rank == 0:
+                self.mlflow_logger.experiment.log_artifact(
+                    self.mlflow_logger.run_id, local_path=os.path.join(self.run_path, self.config_file_name), artifact_path="code/config"
+                )
+                self.mlflow_logger.experiment.log_artifact(self.mlflow_logger.run_id, local_path="train_app", artifact_path="code")
 
-            self.mlflow_logger.experiment.log_artifact(
-                self.mlflow_logger.run_id, local_path=os.path.join(self.run_path, self.config_file_name), artifact_path="code/config"
-            )
-            self.mlflow_logger.experiment.log_artifact(self.mlflow_logger.run_id, local_path="train_app", artifact_path="code")
-
-            p = urlparse(self.mlflow_logger.experiment.get_run(self.mlflow_logger.run_id).info.artifact_uri)
-            mlflow_artifact_path = os.path.abspath(os.path.join(p.netloc, p.path))
-            mlflow_save_path = os.path.join(mlflow_artifact_path, mlflow_save_dir)
-            clean_save_path(mlflow_save_path)
+                p = urlparse(self.mlflow_logger.experiment.get_run(self.mlflow_logger.run_id).info.artifact_uri)
+                mlflow_artifact_path = os.path.abspath(os.path.join(p.netloc, p.path))
+                mlflow_save_path = os.path.join(mlflow_artifact_path, mlflow_save_dir)
+                clean_save_path(mlflow_save_path)
 
             self.loggers.append(self.mlflow_logger)
 
         if "tensorboard" in self.config["loggers"]:
             self.tensorboard_logger = TensorBoardLogger("tensorboard", name=self.project)
             self.loggers.append(self.tensorboard_logger)
+
+    def __generate_callbacks(self, callbackconfig):
+        """Generates the callbacks specified in the given configurations. The callbacks are generated from
+        Pytorch Lightning's callbacks module.
+
+        Parameters
+        ----------
+        callbackconfig : dict
+            _description_
+
+        Returns
+        -------
+        list
+            List of callback objects.
+        """
+        return utils.generate_callbacks(callbackconfig=callbackconfig)
 
 
 class Validation(Trainer):

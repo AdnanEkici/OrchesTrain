@@ -1,46 +1,47 @@
 dataset:
   train:
-    type: ClassificationDataset
-    root_path: &root_path "root_path"
-    classes: &classes ["class1", "class2"]
-    image_sz: &image_sz [512, 512]
+    type: Ade20kDataset
+    split: training
     num_workers: 4
+    image_sz: &image_sz [512, 512]
+    root_path: &root_path root_path
+
     augment:
       A.HorizontalFlip:
         p: 0.5
-      A.Rotate:
-        limit: [-10, 10]
-
   valid:
-    type: ClassificationDataset
-    root_path: *root_path
-    image_sz: *image_sz
-    classes: *classes
+    type: Ade20kDataset
+    split: validation
     num_workers: 4
+    image_sz: *image_sz
+    root_path: *root_path
 
 model:
-  type: Resnet18
+  type: UNet
+
   args:
-    pretrained: True
-    num_classes: 2
+    in_channels: 3
+    out_channels: 151
 
 callbacks:
   ModelCheckpoint:
-    every_n_epochs: 1
+    every_n_epochs: 2
     save_top_k: -1
     verbose: True
 
-loss:
-  type: CrossEntropyLoss
 
-metrics:
-  - metric:
-      type: Accuracy
+losses:
+  - loss:
+      type: CrossEntropyLoss
+      weights: 1
+
+metric:
+  type: PixelAccuracy
 
 hypes:
-  batch_size: 12
+  batch_size: 6
   epochs: 100
-  lr: 0.0001
+  lr: 0.001
 
 optimizers:
   AdamW:

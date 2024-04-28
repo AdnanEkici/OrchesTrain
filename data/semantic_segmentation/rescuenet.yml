@@ -1,0 +1,63 @@
+dataset:
+  train:
+    type: RescueNet
+    num_workers: 6
+    root_dir: path_to_data_root
+    mode: train
+    n_classes: &N 8
+  valid:
+    type: RescueNet
+    num_workers: 6
+    root_dir: path_to_data_root
+    mode: val
+    n_classes: *N
+
+
+model:
+  type: AttU_Net
+  args:
+    img_ch: 3
+    output_ch: 8
+
+callbacks:
+  ModelCheckpoint:
+    every_n_epochs: 1
+    save_top_k: 5
+    monitor: validation/loss
+    verbose: True
+
+losses:
+  - loss:
+      type: CrossEntropyLoss
+
+metrics:
+  - metric:
+      type: PixelAccuracy
+  - metric:
+      type: IoU
+
+hypes:
+  batch_size: 6
+  epochs: 100
+  lr: 0.001
+
+optimizers:
+  SGD:
+    scheduler:
+      type: ReduceLROnPlateau
+      args:
+        patience: 300
+        factor: 0.05
+        min_lr: 0.00002
+        verbose: True
+      monitor: validation/loss
+    args:
+      momentum: 0.9
+      weight_decay: 0.00001
+
+hardware:
+  accelerator: gpu
+  devices: -1
+
+loggers:
+  tensorboard:

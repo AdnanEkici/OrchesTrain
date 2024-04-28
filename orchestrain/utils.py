@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import collections.abc
+import contextlib
 import glob
 import importlib
 import inspect
@@ -9,18 +10,24 @@ import os
 import re
 import shutil
 import time
+from enum import Enum
 from typing import Any
 from typing import Callable
 
 import cv2
 import numpy as np
+import pytorch_lightning as pl
+import pytorch_lightning.callbacks
 import torch
 import torch_snippets  # noqa
 import torchvision  # noqa
 import wandb
 import yaml
+from PIL import Image
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 import orchestrain.dataset as dataset  # noqa
+from orchestrain.registers.model_registry import model_registry
 
 
 class TerminalColors:
@@ -50,18 +57,38 @@ def natural_keys(text):
 
 
 def prepare_directory(path, project, with_weights=True):
-    tmp_path = path + project
+    """Prepares an empty directory in the given directory path to store several train outputs.
+
+    Parameters
+    ----------
+    path : str
+        Root path to be prepared.
+    project : str
+        Name of the project.
+    with_weights : bool, optional
+        Whether to include weights directory or not, by default True
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        Raised when the given path parameter is not a directory.
+
+    """
+    tmp_path = os.path.join(path, project)
     projects_list = sorted(glob.glob(tmp_path + "*"), key=natural_keys)
-    path = tmp_path + str(len(projects_list) + 1) + "/"
-
-    if os.path.isdir(path):
-        print(path + " directory is not empty!")
-        exit(0)
-
-    os.makedirs(path)
-    if with_weights:
-        os.mkdir(path + "weights")
-
+    if pl.utilities.rank_zero_only.rank == 0:
+        path = tmp_path + str(len(projects_list) + 1) + os.sep
+        if os.path.isdir(path):
+            raise RuntimeError(f"{path} directory is not empty!")
+        os.makedirs(path)
+        if with_weights:
+            os.mkdir(os.path.join(path, "weights"))
+    else:
+        path = tmp_path + str(len(projects_list)) + os.sep
     return path
 
 
@@ -110,14 +137,8 @@ def generate_model(model_config):
     """
     model_class_type = model_config["type"]
 
-    import_from = None
-    if "import_from" in model_config.keys():
-        # TODO: change this fix
-        if model_config["import_from"] == "unet.unet":
-            model_config["import_from"] = "train_app.models.unet"
-        import_from = importlib.import_module(model_config["import_from"])
-
-    model_class = eval(model_class_type if import_from is None else f"import_from.{model_class_type}")
+    model_class = model_registry.registered_models.get(model_class_type, None)
+    assert model_class is not None, "The model that has been attempted to be used is not properly registered."
     model_args = model_config["args"] if "args" in model_config.keys() else {}
     model = model_class(**model_args)
     return model, model_class
@@ -154,14 +175,20 @@ def generate_dataset(dataset_conf, task_type):
 
         dataset_ = dataset.TorchVisionDataset(dataset=dataset_, **tmp_conf)
     else:
-        dataset_class = eval(f"dataset.{dataset_class_type}")
+        import_from = dataset
+        if "import_from" in tmp_conf:
+            import_from = importlib.import_module(tmp_conf["import_from"])
+            del tmp_conf["import_from"]
+
+        dataset_class = getattr(import_from, dataset_class_type)
         dataset_ = dataset_class(**tmp_conf)
 
     return dataset_, dataset_class
 
 
 def deep_update(first: dict[Any, Any], second: dict[Any, Any]) -> dict[Any, Any]:
-    """deep update the first dict with second dict. If first dict has a node contains second dict, than first ditcs related part updates only
+    """deep update the first dict with second dict. If first dict has a node contains second dict, then the related part of the
+    first dict gets updated only.
 
     Parameters
     ----------
@@ -221,7 +248,7 @@ def get_model_path(model_path: str) -> str:
             raise RuntimeError("wandb.run is None")
 
         artifact = wandb_run.use_artifact(model_path, type="model")
-        tmp_path = f"/tmp/falcon-trainer/{str(time.time())}/"
+        tmp_path = f"/tmp/orchestrain/{str(time.time())}/"
         os.makedirs(tmp_path, exist_ok=True)
         shutil.rmtree(tmp_path)
         model_download_dir_path = artifact.download(root=tmp_path)
@@ -239,20 +266,20 @@ def get_model_path(model_path: str) -> str:
     except wandb.errors.CommError:
         raise RuntimeError(
             f"There is no model with path: {model_path}. Check your model path or \
-            is wandb logged in correst hots! sample connection: 'wandb login --host=http://ip --relogin'"
+            is wandb logged in correst hots! sample connection: 'wandb login --host=http://10.0.70.247:8080 --relogin'"
         )
 
     if not os.path.exists(model_path):
         raise RuntimeError(
             f"Model path not exists. Path: {model_path}. If you want to download \
-            model from wandb in training server, use: 'wandb login --host=http://ip --relogin'"
+            model from wandb in training server, use: 'wandb login --host=http://10.0.70.247:8080 --relogin'"
         )
     return model_path
 
 
 def load_model(model_path: str, model_config: dict, force_config: bool = False):
-    """generate the model and and loads the state dict from given model path.
-    Model path can be local file or wandb artifact path
+    """Generates the model and and loads the state dict from given model path.
+    Model path can be a local file or wandb artifact path
 
     Parameters
     ----------
@@ -280,7 +307,7 @@ def load_model(model_path: str, model_config: dict, force_config: bool = False):
     if not force_config and "hyper_parameters" in model_dict:
         try:
             model_config_tmp = model_dict["hyper_parameters"]["config"]["model"]
-            if model_config is not None:
+            if model_config is not None and pl.utilities.rank_zero_only.rank == 0:
                 print(TerminalColors.RED + "Warn! Loading model with the original config: ")
                 print(yaml.dump({"model": model_config_tmp}, indent=4) + TerminalColors.END)
 
@@ -295,11 +322,11 @@ def load_model(model_path: str, model_config: dict, force_config: bool = False):
 
     if "state_dict" in model_dict:
         # corrects the keys in state_dict
-        model_dict["state_dict"] = {
-            key.replace("model.", "").replace("unet.", ""): model_dict["state_dict"][key]
-            for key in model_dict["state_dict"].keys()
-            if "criterion.bce_loss.pos_weigh" not in key or "criterion1.pos_weight" not in key
-        }
+        # model_dict["state_dict"] = {
+        #     key.replace("model.", "").replace("unet.", ""): model_dict["state_dict"][key]
+        #     for key in model_dict["state_dict"].keys()
+        #     if "criterion.bce_loss.pos_weigh" not in key or "criterion1.pos_weight" not in key
+        # }
         model.load_state_dict(model_dict["state_dict"])
     else:
         model.load_state_dict(model_dict)
@@ -307,8 +334,9 @@ def load_model(model_path: str, model_config: dict, force_config: bool = False):
     return model, model_config
 
 
+@rank_zero_only
 def print_config(config):
-    """prints the config with yaml formatted
+    """Prints the config with yaml formatted.
 
     Parameters
     ----------
@@ -416,7 +444,7 @@ def img_to_boxes(image):
     return NMS(bboxes)
 
 
-def NMS(boxes, overlapThresh=0.4):
+def NMS(boxes, overlap_thresh=0.4):
     """Applies non-maximum suppression (NMS) to a set of bounding boxes.
 
     Parameters
@@ -424,6 +452,9 @@ def NMS(boxes, overlapThresh=0.4):
     boxes: numpy.ndarray
         An array of bounding boxes in the format (x1, y1, x2, y2). overlapThresh (float, optional): The overlap threshold for
         suppressing overlapping boxes. Default is 0.4.
+
+    overlap_thresh: float
+        Threshold to suppress bboxes.
 
     Returns
     -------
@@ -461,8 +492,8 @@ def NMS(boxes, overlapThresh=0.4):
         h = np.maximum(0, yy2 - yy1 + 1)
         # compute the ratio of overlap
         overlap = (w * h) / areas[temp_indices]
-        # if the actual boungding box has an overlap bigger than treshold with any other box, remove it's index
-        if np.any(overlap) > overlapThresh:
+        # if the actual bounding box has an overlap bigger than threshold with any other box, remove it's index
+        if np.any(overlap) > overlap_thresh:
             indices = indices[indices != i]
     # return only the boxes at the remaining indices
     return boxes[indices].astype(int)
@@ -535,7 +566,10 @@ def calculate_precision_recall(bbox_true, bbox_pred, iou_threshold):
     """
     true_positives = 0
     false_positives = 0
-    false_negatives = 0
+
+    bbox_pred, bbox_true = np.asarray(bbox_pred), np.asarray(bbox_true)
+    bbox_pred[bbox_pred < 0] = 0
+    bbox_true[bbox_true < 0] = 0
 
     # Calculate IoU for each predicted bounding box
     for bbox_p in bbox_pred:
@@ -551,14 +585,14 @@ def calculate_precision_recall(bbox_true, bbox_pred, iou_threshold):
 
     false_negatives = len(bbox_true) - true_positives
 
-    precision = true_positives / (true_positives + false_positives)
-    recall = true_positives / (true_positives + false_negatives)
+    precision = true_positives / (true_positives + false_positives) if len(bbox_pred) != 0 else -1
+    recall = true_positives / (true_positives + false_negatives) if len(bbox_true) != 0 else -1
 
     return precision, recall
 
 
 def copy_doc(copy_func: Callable) -> Callable:
-    """Copies docstring of givem callable
+    """Copies docstring of given callable
 
     Parameters
     ----------
@@ -575,3 +609,248 @@ def copy_doc(copy_func: Callable) -> Callable:
         return func
 
     return wrapper
+
+
+def generate_callbacks(callbackconfig):
+    if callbackconfig is None:
+        return []
+
+    def new_callback(class_name, *args, **kwargs):
+        callback = getattr(pytorch_lightning.callbacks, class_name)
+        return callback(*args, **kwargs)
+
+    return [new_callback(callback, **callbackconfig[callback]) for callback in callbackconfig.keys()]
+
+
+class Profiler:
+    class ProfilerState(Enum):
+        ACTIVE = "active"
+        PASSIVE = "passive"
+
+    state: ProfilerState = ProfilerState.PASSIVE
+    log_every_n_epochs = 2
+    log_initial_epoch = False
+
+    @staticmethod
+    def load_cfg(cfg):
+        Profiler.log_every_n_epochs = cfg["log_every_n_epochs"]
+        Profiler.log_initial_epoch = cfg["log_initial_epoch"]
+
+        if Profiler.log_every_n_epochs == -1:
+            Profiler.logging = False
+
+    @staticmethod
+    @contextlib.contextmanager
+    def profile_time(logger_func, log_name, log_cpu_time=True, log_gpu_time=True, current_epoch=None):
+        """Provides synchronized time profiling for both gpu and cpu"""
+
+        if current_epoch is not None:
+            if Profiler.log_every_n_epochs == -1:
+                Profiler.state = Profiler.ProfilerState.PASSIVE
+            elif current_epoch % Profiler.log_every_n_epochs == 0:
+                Profiler.state = Profiler.ProfilerState.ACTIVE
+
+            if Profiler.log_initial_epoch and current_epoch == 0:
+                Profiler.state = Profiler.ProfilerState.ACTIVE
+        else:
+            Profiler.state = Profiler.ProfilerState.ACTIVE
+
+        if log_gpu_time and Profiler.state == Profiler.ProfilerState.ACTIVE:
+            stream = torch.cuda.current_stream()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            stream.record_event(start)
+
+        try:
+            cpu_start = time.monotonic()
+            yield
+        finally:
+            cpu_end = time.monotonic()
+            cpu_time = (cpu_end - cpu_start) * 1000
+
+            if log_gpu_time and Profiler.state == Profiler.ProfilerState.ACTIVE:
+                stream.record_event(end)
+                end.synchronize()
+                gpu_time = start.elapsed_time(end)
+                logger_func("profiler/" + log_name + "_gpu", gpu_time)
+
+            if log_cpu_time and Profiler.state == Profiler.ProfilerState.ACTIVE:
+                logger_func("profiler/" + log_name + "_cpu", cpu_time)
+
+
+def get_files(folder, name_filter=None, extension_filter=None):
+    """Helper function that returns the list of files in a specified folder
+    with a specified extension.
+
+    Keyword arguments:
+    - folder (``string``): The path to a folder.
+    - name_filter (```string``, optional): The returned files must contain
+    this substring in their filename. Default: None; files are not filtered.
+    - extension_filter (``string``, optional): The desired file extension.
+    Default: None; files are not filtered
+
+    """
+    if not os.path.isdir(folder):
+        raise RuntimeError(f'"{folder}" is not a folder.')
+
+    # Filename filter: if not specified don't filter (condition always true);
+    # otherwise, use a lambda expression to filter out files that do not
+    # contain "name_filter"
+    if name_filter is None:
+        # This looks hackish...there is probably a better way
+        def name_cond(filename):
+            return True
+
+    else:
+
+        def name_cond(filename):
+            return name_filter in filename
+
+    # Extension filter: if not specified don't filter (condition always true);
+    # otherwise, use a lambda expression to filter out files whose extension
+    # is not "extension_filter"
+    if extension_filter is None:
+        # This looks hackish...there is probably a better way
+        def ext_cond(filename):
+            return True
+
+    else:
+
+        def ext_cond(filename):
+            return filename.endswith(extension_filter)
+
+    filtered_files = []
+
+    # Explore the directory tree to get files that contain "name_filter" and
+    # with extension "extension_filter"
+    for path, _, files in os.walk(folder):
+        files.sort()
+        for file in files:
+            if name_cond(file) and ext_cond(file):
+                full_path = os.path.join(path, file)
+                filtered_files.append(full_path)
+
+    return filtered_files
+
+
+def pil_loader(data_path, label_path):
+    """Loads a sample and label image given their path as PIL images.
+
+    Keyword arguments:
+    - data_path (``string``): The filepath to the image.
+    - label_path (``string``): The filepath to the ground-truth image.
+
+    Returns the image and the label as PIL images.
+
+    """
+    data = Image.open(data_path)
+    label = Image.open(label_path)
+
+    return data, label
+
+
+def remap(image, old_values, new_values):
+    assert isinstance(image, Image.Image) or isinstance(image, np.ndarray), "image must be of type PIL.Image or numpy.ndarray"
+    assert type(new_values) is tuple, "new_values must be of type tuple"
+    assert type(old_values) is tuple, "old_values must be of type tuple"
+    assert len(new_values) == len(old_values), "new_values and old_values must have the same length"
+
+    # If image is a PIL.Image convert it to a numpy array
+    if isinstance(image, Image.Image):
+        image = np.array(image)
+
+    # Replace old values by the new ones
+    tmp = np.zeros_like(image)
+    for old, new in zip(old_values, new_values):
+        # Since tmp is already initialized as zeros we can skip new values
+        # equal to 0
+        if new != 0:
+            tmp[image == old] = new
+
+    return Image.fromarray(tmp)
+
+
+def enet_weighing(dataloader, num_classes, c=1.02):
+    """Computes class weights as described in the ENet paper:
+
+        w_class = 1 / (ln(c + p_class)),
+
+    where c is usually 1.02 and p_class is the propensity score of that
+    class:
+
+        propensity_score = freq_class / total_pixels.
+
+    References: https://arxiv.org/abs/1606.02147
+
+    Keyword arguments:
+    - dataloader (``data.Dataloader``): A data loader to iterate over the
+    dataset.
+    - num_classes (``int``): The number of classes.
+    - c (``int``, optional): AN additional hyper-parameter which restricts
+    the interval of values for the weights. Default: 1.02.
+
+    """
+    class_count = 0
+    total = 0
+    for _, label in dataloader:
+        label = label.cpu().numpy()
+
+        # Flatten label
+        flat_label = label.flatten()
+
+        # Sum up the number of pixels of each class and the total pixel
+        # counts for each label
+        class_count += np.bincount(flat_label, minlength=num_classes)
+        total += flat_label.size
+
+    # Compute propensity score and then the weights for each class
+    propensity_score = class_count / total
+    class_weights = 1 / (np.log(c + propensity_score))
+
+    return class_weights
+
+
+def median_freq_balancing(dataloader, num_classes):
+    """Computes class weights using median frequency balancing as described
+    in https://arxiv.org/abs/1411.4734:
+
+        w_class = median_freq / freq_class,
+
+    where freq_class is the number of pixels of a given class divided by
+    the total number of pixels in images where that class is present, and
+    median_freq is the median of freq_class.
+
+    Keyword arguments:
+    - dataloader (``data.Dataloader``): A data loader to iterate over the
+    dataset.
+    whose weights are going to be computed.
+    - num_classes (``int``): The number of classes
+
+    """
+    class_count = 0
+    total = 0
+    for _, label in dataloader:
+        label = label.cpu().numpy()
+
+        # Flatten label
+        flat_label = label.flatten()
+
+        # Sum up the class frequencies
+        bincount = np.bincount(flat_label, minlength=num_classes)
+
+        # Create of mask of classes that exist in the label
+        mask = bincount > 0
+        # Multiply the mask by the pixel count. The resulting array has
+        # one element for each class. The value is either 0 (if the class
+        # does not exist in the label) or equal to the pixel count (if
+        # the class exists in the label)
+        total += mask * flat_label.size
+
+        # Sum up the number of pixels found for each class
+        class_count += bincount
+
+    # Compute the frequency and its median
+    freq = class_count / total
+    med = np.median(freq)
+
+    return med / freq

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import warnings
 from typing import Callable
 
 import cv2
 import numpy as np
 import torch
 import torch_snippets  # noqa
+from monai.networks import one_hot
 from scipy.ndimage import distance_transform_edt
 
 import orchestrain.loss.loss_utils as loss_utils
@@ -110,8 +112,20 @@ class BaseLoss(torch.nn.Module):
         """Hook method called at the start of the testing phase."""
         pass
 
+    def on_train_epoch_end(self):
+        """Hook method called at the end of each training epoch."""
+        pass
+
     def on_validation_epoch_end(self):
         """Hook method called at the end of each validation epoch."""
+        pass
+
+    def on_test_end(self):
+        """Hook method called at the end of the testing phase."""
+        pass
+
+    def on_test_epoch_end(self):
+        """Hook method called at the end of test epoch."""
         pass
 
 
@@ -139,9 +153,9 @@ class CrossEntropyLoss(BaseLoss):
 
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, ignore_index=-1, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.crossEntropyLoss = torch.nn.CrossEntropyLoss()
+        self.crossEntropyLoss = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
 
     def forward(self, prediction, target):
         """Computes the cross entropy loss between prediction and target."""
@@ -150,13 +164,17 @@ class CrossEntropyLoss(BaseLoss):
         return loss
 
 
-class DiceLoss(BaseLoss):
-    """Dice loss for segmentation tasks.
+class TverskyLoss(BaseLoss):
+    """Tversky loss for segmentation tasks.
     This class extends the BaseLoss class and implements the forward method for computing
-    the Dice loss between predicted and target segmentation masks.
+    the Tversky loss between predicted and target segmentation masks.
 
     Parameters
     ----------
+    alpha: float
+        Weight of false positives.
+    beta: float
+        Weight of false negatives.
     *args
         Variable length argument list.
     **kwargs
@@ -166,13 +184,22 @@ class DiceLoss(BaseLoss):
     --------
     BaseLoss
         Base class for custom loss functions.
+
+    Notes
+    -----
+    To increase the effect of false positives on loss increase the alpha value.
+    To increase the effect of false negatives on loss increase the beta value.
+
     """
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, alpha=0.5, beta=0.5, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.alpha = alpha
+        self.beta = beta
 
-    def forward(self, prediction, target, smooth=1, *args, **kwarg):
-        """Computes the Dice loss between predicted and target segmentation masks.
+    def forward(self, prediction, target, smooth=1e-7, *args, **kwargs):
+        """Computes the Tversky loss between predicted and target segmentation masks. Expects for a prediction of shape
+        (B, C, W, H) or (B, C, W, H, D), and a target of shape (B, W, H) or (B, W, H, D).
 
         Parameters
         ----------
@@ -190,19 +217,108 @@ class DiceLoss(BaseLoss):
         Returns
         -------
         torch.Tensor
-            The computed Dice loss.
-
-        Note
-        ----
-        The inputs `prediction` and `target` should have the same shape.
+            The computed Tversky loss.
 
         """
-        prediction_tmp = torch_snippets.F.sigmoid(prediction).view(-1)
-        target_tmp = target.view(-1)
+        # Handle if prediction comes in shape (B,H,W)
+        prediction = prediction.unsqueeze(1) if len(prediction.shape) == 3 else prediction
 
-        intersection = (prediction_tmp * target_tmp).sum()
-        dice_loss = 1 - (2.0 * intersection + smooth) / (prediction_tmp.sum() + target_tmp.sum() + smooth)
-        return dice_loss
+        num_classes = prediction.shape[1]
+        target = target.squeeze(1)
+        if num_classes == 1:
+            target_one_hot = torch.nn.functional.one_hot(target, num_classes + 1)
+            prediction = torch.sigmoid(prediction)
+            prediction_tmp = torch.cat((prediction, 1 - prediction), 1).view(-1)
+        else:
+            target_one_hot = torch.nn.functional.one_hot(target, num_classes)
+            prediction_tmp = torch.softmax(prediction, 1).view(-1)
+
+        # To keep channel in second dimension
+        target_one_hot = torch.swapaxes(target_one_hot, -1, 1).contiguous().view(-1)
+
+        tp = (prediction_tmp * target_one_hot).sum()
+        fp = (prediction_tmp * (1 - target_one_hot)).sum()
+        fn = ((1 - prediction_tmp) * target_one_hot).sum()
+
+        tversky = (tp + smooth) / (tp + self.alpha * fp + self.beta * fn + smooth)
+
+        return 1 - tversky
+
+
+class FocalTverskyLoss(BaseLoss):
+    """Focal Tversky loss a variant of Tversky loss.
+
+    Parameters
+    ----------
+    alpha: float
+        Weight of false positives.
+    beta: float
+        Weight of false negatives.
+    gamma: float
+        Power of tversky loss to be returned.
+    *args
+        Variable length argument list.
+    **kwargs
+        Arbitrary keyword arguments.
+
+    Inherits
+    --------
+    TverskyLoss
+        Class for computing Tversky loss.
+
+    """
+
+    def __init__(self, alpha=0.5, beta=0.5, gamma=1, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.tversky = TverskyLoss(alpha, beta, *args, **kwargs)
+        self.gamma = gamma
+
+    def forward(self, prediction, target, smooth=1e-7, *args, **kwargs):
+        """Computes the Focal Tversky loss, which is assumed to be (TverskyLoss)^gamma, between predicted and target segmentation masks.
+        Expects for a prediction of shape (B, C, W, H) or (B, C, W, H, D), and a target of shape (B, W, H) or (B, W, H, D).
+
+        Parameters
+        ----------
+        prediction: torch.Tensor
+            The predicted segmentation mask tensor.
+        target: torch.Tensor
+            The target segmentation mask tensor.
+        smooth: float, optional
+            Smoothing factor to avoid division by zero. Defaults to 1.
+        *args
+            Variable length argument list.
+        **kwargs
+            Arbitrary keyword arguments.
+
+        Returns
+        -------
+        torch.Tensor
+            The computed Focal Tversky loss.
+
+        """
+        return self.tversky(prediction, target, smooth, *args, **kwargs) ** self.gamma
+
+
+class DiceLoss(TverskyLoss):
+    """Dice loss for segmentation tasks. This class extends the TverskyLoss class and sets the alpha and beta values to
+    0.5 which yields the same formula for Dice loss.
+
+    Parameters
+    ----------
+    *args
+        Variable length argument list.
+    **kwargs
+        Arbitrary keyword arguments.
+
+    Inherits
+    --------
+    TverskyLoss
+        Base class for custom loss functions.
+
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(0.5, 0.5, *args, **kwargs)
 
 
 class BCEWithLogitsLoss(BaseLoss):
@@ -275,7 +391,7 @@ class BCEWithLogitsLoss(BaseLoss):
 # TODO: We want to split current losses into metrics and loss.  Metrics cannot be used for backpropagation during training,
 # but users can utilize them to calculate metrics for the training dataset.
 class BoxValidationLoss(BaseLoss):
-    """Box validation loss for evaluating object detection models.
+    """Computes the Box Validation loss for evaluating object detection models.
 
     Parameters
     ----------
@@ -302,6 +418,10 @@ class BoxValidationLoss(BaseLoss):
     BaseLoss
         Base class for custom loss functions.
 
+    Note
+    ----
+        Uses sigmoid function on prediction.
+
     """
 
     import sklearn.metrics as metrics
@@ -327,9 +447,10 @@ class BoxValidationLoss(BaseLoss):
             NumPy array representation of the image.
 
         """
+        eps = 1e-7
         img_out = img.cpu().detach().numpy().transpose(1, 2, 0)
         img_out[img_out < 0] = 0
-        mul = 255 / max(img_out.max(), 1e-7)
+        mul = 255 / max(img_out.max(), eps)
         img_out *= mul
         img_out = img_out.astype(np.uint8)
         return img_out
@@ -532,3 +653,160 @@ class BoundaryLoss(BaseLoss):
 
         loss = dist_maps * prediction  # einsum("bkwh,bkwh->bkwh", inputs, targets)
         return loss.mean()
+
+
+class HDLoss(BaseLoss):
+    """HD (Hausdorff Distance) loss class for segmentation tasks.
+
+    Parameters
+    ----------
+    include_background: bool
+        If False, channel index 0 (background category) is excluded from the calculation. if the non-background segmentations are small compared to
+        the total image size they can get overwhelmed by the signal from the background so excluding it in such cases helps convergence.
+    to_onehot_y: bool
+        Whether to convert `y` into the one-hot format. Defaults to False.
+    sigmoid: bool
+        If True, apply a sigmoid function to the prediction.
+    softmax: bool
+        If True, apply a softmax function to the prediction.
+    other_act: Callable
+        If don't want to use `sigmoid` or `softmax`, use other callable function to execute other activation layers, Defaults to ``None``.
+        for example: `other_act = torch.tanh`.
+    reduction: str
+        {``"none"``, ``"mean"``, ``"sum"``}. Specifies the reduction to apply to the output. Defaults to ``"mean"``.
+        # - ``"none"``: no reduction will be applied.
+        - ``"mean"``: the sum of the output will be divided by the number of elements in the output.
+        - ``"sum"``: the output will be summed.
+    batch: bool
+        whether to sum the intersection and union areas over the batch dimension before the dividing. Defaults to False, a Dice loss value is computed
+        independently from each item in the batch before any `reduction`.
+
+    Attributes
+    ----------
+    include_background: bool
+    to_onehot_y: bool
+    sigmoid: bool
+    softmax: bool
+    other_act: Callable
+    batch: bool
+    reduction: str
+
+    Inherits
+    --------
+    BaseLoss
+        Base class for custom loss functions.
+
+    Raises
+    ------
+    TypeError
+        When ``other_act`` is not an ``Optional[Callable]``.
+    ValueError
+        When more than 1 of [``sigmoid=True``, ``softmax=True``, ``other_act is not None``]. Incompatible values.
+
+    """
+
+    def __init__(
+        self,
+        include_background: bool = True,
+        to_onehot_y: bool = False,
+        sigmoid: bool = True,
+        softmax: bool = False,
+        other_act=None,
+        reduction="mean",
+        batch: bool = False,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if other_act is not None and not callable(other_act):
+            raise TypeError(f"other_act must be None or callable but is {type(other_act).__name__}.")
+        if int(sigmoid) + int(softmax) + int(other_act is not None) > 1:
+            raise ValueError("Incompatible values: more than 1 of [sigmoid=True, softmax=True, other_act is not None].")
+        self.include_background = include_background
+        self.to_onehot_y = to_onehot_y
+        self.sigmoid = sigmoid
+        self.softmax = softmax
+        self.other_act = other_act
+        self.batch = batch
+        self.reduction = reduction
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        """Computes the forward pass of the HDLoss.
+        Parameters
+        ----------
+        prediction
+            The shape should be BNH[WD], where N is the number of classes.
+        target
+            The shape should be BNH[WD] or B1H[WD], where N is the number of classes.
+
+        Raises
+        ------
+        AssertionError
+            When prediction and target (after one hot transform if set) have different shapes.
+        ValueError
+            When ``self.reduction`` is not one of ["mean", "sum", "none"].
+
+        Example
+        -------
+            >>> from monai.losses.dice import *  # NOQA
+            >>> import torch
+            >>> from monai.losses.dice import DiceLoss
+            >>> B, C, H, W = 7, 5, 3, 2
+            >>> prediction = torch.rand(B, C, H, W)
+            >>> target_idx = torch.randint(low=0, high=C - 1, size=(B, H, W)).long()
+            >>> target = one_hot(target_idx[:, None, ...], num_classes=C)
+            >>> self = DiceLoss(reduction='none')
+            >>> loss = self(prediction, target)
+            >>> assert np.broadcast_shapes(loss.shape, prediction.shape) == prediction.shape
+
+        """
+        if self.sigmoid:
+            prediction = torch.sigmoid(prediction)
+
+        n_pred_ch = prediction.shape[1]
+        if self.softmax:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `softmax=True` ignored.")
+            else:
+                prediction = torch.softmax(prediction, 1)
+
+        if self.other_act is not None:
+            prediction = self.other_act(prediction)
+
+        if self.to_onehot_y:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `to_onehot_y=True` ignored.")
+            else:
+                target = one_hot(target, num_classes=n_pred_ch)
+
+        if not self.include_background:
+            if n_pred_ch == 1:
+                warnings.warn("single channel prediction, `include_background=False` ignored.")
+            else:
+                # if skipping background, removing first channel
+                target = target[:, 1:]
+                prediction = prediction[:, 1:]
+
+        if target.shape != prediction.shape:
+            raise AssertionError(f"ground truth has different shape ({target.shape}) from prediction ({prediction.shape})")
+
+        with torch.no_grad():
+            # defalut using compute_dtm; however, compute_dtm01 is also worth to try;
+            # gt_dtm = compute_dtm01(target.cpu().numpy(), prediction.shape, prediction.device.index)
+            gt_dtm = loss_utils.compute_dtm_gpu(target > 0.5, prediction.shape)
+            # seg_dtm = compute_dtm01(prediction.cpu().numpy()>0.5, prediction.shape, prediction.device.index)
+            seg_dtm = loss_utils.compute_dtm_gpu(prediction > 0.5, prediction.shape)
+        loss_hd = loss_utils.hd_loss(prediction, target, seg_dtm, gt_dtm)
+        if self.reduction == "mean":
+            loss_hd = torch.mean(loss_hd)  # the batch and channel average
+        elif self.reduction == "sum":
+            loss_hd = torch.sum(loss_hd)  # sum over the batch and channel dims
+        # elif self.reduction == LossReduction.NONE.value:
+        #    # If we are not computing voxelwise loss components at least
+        #    # make sure a none reduction maintains a broadcastable shape
+        #    broadcast_shape = list(loss_hd.shape[0:2]) + [1] * (len(prediction.shape) - 2)
+        #    loss_hd = loss_hd.view(broadcast_shape)
+        else:
+            raise ValueError(f'Unsupported reduction: {self.reduction}, available options are ["mean", "sum", "none"].')
+
+        return loss_hd

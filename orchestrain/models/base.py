@@ -78,6 +78,7 @@ class ModelBase(pl.LightningModule):
 
         """
         total_loss = None
+
         for loss, loss_config in self.losses + self.metrics:
             if self.state.value.casefold() in loss_config["apply_on"]:
                 try:
@@ -153,7 +154,7 @@ class ModelBase(pl.LightningModule):
 
         return loss_value
 
-    def __on_start(self):
+    def _on_start(self):
         """Performs initialization steps at the start of training, validation, or testing.
         Initializes the loss and measurers for the training process.
 
@@ -163,10 +164,6 @@ class ModelBase(pl.LightningModule):
             If no loss is found in the configuration.
 
         """
-        if self.visualize:
-            cv2.namedWindow("loss", cv2.WINDOW_GUI_NORMAL)
-            cv2.namedWindow("input", cv2.WINDOW_GUI_NORMAL)
-            cv2.namedWindow("prediction", cv2.WINDOW_GUI_NORMAL)
 
         # Lazy load losses,
         # if task is inference losses will not be loaded.
@@ -176,12 +173,15 @@ class ModelBase(pl.LightningModule):
         self.hypes_config = self.config["hypes"]
         self.losses = []
 
+        # TODO: Add a YAML validity checker
         def create_measurers(config, keys):
             measurers = []
             for key in keys:
                 if key in config.keys():
                     self.measurer_config = config[key]
-
+                    break
+                else:
+                    return []
             for measurer_item in self.measurer_config:
                 measurer_config = list(measurer_item.values())[0]
                 class_type = measurer_config["type"]
@@ -203,7 +203,7 @@ class ModelBase(pl.LightningModule):
         self.losses = create_measurers(self.config, ["losses", "loss"])
 
         if len(self.losses) == 0:
-            raise RuntimeError("no loss found!")
+            raise RuntimeError("No loss found in config. Please define loss in the config file!")
 
     # --- protected functions ---
     def _post_processing(self, batch: dict):
@@ -223,7 +223,10 @@ class ModelBase(pl.LightningModule):
         return batch
 
     def _visualize(self, batch):
-        raise NotImplementedError("You are trying to visualize model predictions, but the model used currently does not support visualization.")
+        raise NotImplementedError(
+            "You are trying to visualize model predictions, "
+            "but the _visualize function is not implemented. See the documentation to find out how to do it."
+        )
 
     # --- callback functions ---
     @__loss_callback
@@ -238,7 +241,7 @@ class ModelBase(pl.LightningModule):
         self.log_prefix = "test/"
         self.state = ModelBase.State.Test
 
-        self.__on_start()
+        self._on_start()
 
     @__loss_callback
     def on_train_epoch_start(self) -> None:
@@ -248,8 +251,25 @@ class ModelBase(pl.LightningModule):
         self.log("train/learning_rate", self.optimizers().param_groups[0]["lr"], sync_dist=True)
 
     @__loss_callback
+    def on_train_epoch_end(self) -> None:
+        self.log_prefix = "train/"
+        for loss, loss_config in self.metrics:
+            if hasattr(loss, "on_epoch_end"):
+                loss.on_epoch_end()
+
+    @__loss_callback
     def on_validation_epoch_end(self) -> None:
-        pass
+        self.log_prefix = "validation/"
+        for loss, loss_config in self.metrics:
+            if hasattr(loss, "on_epoch_end"):
+                loss.on_epoch_end()
+
+    @__loss_callback
+    def on_test_epoch_end(self) -> None:
+        self.log_prefix = "test/"
+        for loss, loss_config in self.metrics:
+            if hasattr(loss, "on_epoch_end"):
+                loss.on_epoch_end()
 
     def on_fit_start(self) -> None:
         super().on_fit_start()
@@ -257,16 +277,16 @@ class ModelBase(pl.LightningModule):
         if not self.config:
             raise RuntimeError("no config found!")
 
-        self.__on_start()
+        self._on_start()
 
     def on_validation_start(self) -> None:
-        self.__on_start()
+        self._on_start()
         return super().on_validation_start()
 
     def on_save_checkpoint(self, checkpoint: dict[str, typing.Any]) -> None:
         """Callback function called when saving a checkpoint.
 
-        Args
+        Parameters
         ----
         checkpoint: dict
             The checkpoint to be saved.
@@ -291,12 +311,29 @@ class ModelBase(pl.LightningModule):
             The optimizer, learning rate scheduler, and monitoring metric.
 
         """
-        # TODO: add support to other schedulers and optimizers
-        optimizer = torch.optim.AdamW(self.parameters(), lr=0.001)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, patience=300, factor=0.05, min_lr=0.00002, verbose=True)
+        if ("optimizers" not in self.config) or (len(self.config["optimizers"]) == 0):
+            raise RuntimeError("You have to specify an optimizer under the optim tab.")
+        # TODO: Support more than one optimizer
+        optimizer_name = list(self.config["optimizers"].keys())[0]
+        optimizer_class = getattr(torch.optim, optimizer_name)
+        optimizer_args = self.config["optimizers"][optimizer_name].get("args", {})
+        optimizer_args["lr"] = optimizer_args.get("lr", self.config["hypes"]["lr"])
+        # TODO: Add logger and use in such cases.
+        if pl.utilities.rank_zero_only.rank == 0:
+            print(f"Optimizer's learning rate has been set to {optimizer_args['lr']}")
 
-        # HINT: validation/loss is defined from __measure_model
-        return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": "validation/loss"}
+        optimizer = optimizer_class(params=self.parameters(), **optimizer_args)
+        scheduler = monitor = None
+        if "scheduler" in self.config["optimizers"][optimizer_name]:
+            scheduler_info = self.config["optimizers"][optimizer_name]["scheduler"]
+            scheduler_class = getattr(torch.optim.lr_scheduler, scheduler_info["type"])
+            scheduler_args = scheduler_info.get("args", {})
+            scheduler = scheduler_class(optimizer=optimizer, **scheduler_args)
+            # TODO: Metrics should be able to detected automatically, if selected metric is not exists, warn user and use training/loss
+            monitor = scheduler_info.get("monitor", "training/loss")
+            return {"optimizer": optimizer, "lr_scheduler": scheduler, "monitor": monitor}
+        else:
+            return optimizer
 
     # WARN: in python <= 3.8, using decorators makes mem leak in GPU
     def training_step(self, batch: dict, batch_idx):
@@ -307,17 +344,8 @@ class ModelBase(pl.LightningModule):
 
     # WARN: in python <= 3.8, using decorators makes mem leak in GPU
     def validation_step(self, batch, batch_idx):
-        starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        starter.record()
         batch = self.feed_batch(batch)
-        ender.record()
-        torch.cuda.synchronize()
-        model_compute_time = starter.elapsed_time(ender) / 1000
-
         loss_value = self.__handle_predictions(batch)
-
-        self.log("validation/comp_time_batch", model_compute_time, sync_dist=True)
-        self.log("validation/comp_time_one_frame", model_compute_time / self.hypes_config["batch_size"], sync_dist=True)
 
         return loss_value
 
@@ -388,6 +416,13 @@ class MultiInputSegmetationAdapter(ModelBase):
 
     """
 
+    def _on_start(self, *args, **kwargs):
+        super()._on_start(*args, **kwargs)
+        if self.visualize:
+            cv2.namedWindow("loss", cv2.WINDOW_GUI_NORMAL)
+            cv2.namedWindow("input", cv2.WINDOW_GUI_NORMAL)
+            cv2.namedWindow("prediction", cv2.WINDOW_GUI_NORMAL)
+
     def __tensor_to_img(self, tensor_img: torch.Tensor):
         return (tensor_img * 255).permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8)
 
@@ -445,26 +480,31 @@ class MultiInputSegmetationAdapter(ModelBase):
 
 
 class SemanticSegmentationAdapter(ModelBase):
+    def _on_start(self, *args, **kwargs):
+        super()._on_start(*args, **kwargs)
+        if self.visualize:
+            cv2.namedWindow("target", cv2.WINDOW_GUI_NORMAL)
+            cv2.namedWindow("input", cv2.WINDOW_GUI_NORMAL)
+            cv2.namedWindow("prediction", cv2.WINDOW_GUI_NORMAL)
+
     def __tensor_to_img(self, tensor_img: torch.Tensor):
         if tensor_img.size(0) == 3:
             tensor_img = tensor_img.permute(1, 2, 0)
         return tensor_img.detach().cpu().numpy().astype(np.uint8)
 
     def _visualize(self, batch):
-        mask_gt = self.__tensor_to_img(batch["target"][0])
+        mask_gt = self.__tensor_to_img(batch["target"][0] * (batch["target"][0] >= 0))
         mask_pred = self.__tensor_to_img(torch.softmax(batch["prediction"][0], dim=0).argmax(dim=0))
-
-        intersection_image = cv2.bitwise_and(mask_gt, mask_pred)
-        loss_image = cv2.merge((intersection_image, mask_gt, mask_pred))
 
         if self.postprocess:
             mask_pred = self.postprocess(mask_pred)
+            mask_gt = self.postprocess(mask_gt)
 
         input = self.__tensor_to_img(batch["inputs"][0] * 255)
 
         cv2.imshow("prediction", mask_pred)
         cv2.imshow("input", input)
-        cv2.imshow("loss", loss_image)
+        cv2.imshow("target", mask_gt)
         cv2.waitKey(1)
 
     @copy_doc(MultiInputSegmetationAdapter.feed_batch)

@@ -1,0 +1,78 @@
+dataset:
+  train:
+    type: UCF101Dataset
+    root_path: &root_path data/UCF101/UCF-101
+    class_file: &class_file data/UCF101/ucfTrainTestlist/classInd.txt
+    labels_file: data/UCF101/ucfTrainTestlist/trainlist01.txt
+    image_sz: &image_size [256, 256]
+    frames_per_clip: 8
+    num_workers: 4
+    augment:
+      A.HorizontalFlip:
+        p: 0.5
+      A.RandomCrop:
+        p: 1.0
+        width: 224
+        height: 224
+
+  valid:
+    type: UCF101Dataset
+    root_path: *root_path
+    labels_file: data/UCF101/ucfTrainTestlist/testlist01.txt
+    class_file: *class_file
+    image_sz: *image_size
+    frames_per_clip: 8
+    num_workers: 4
+    augment:
+      A.HorizontalFlip:
+        p: 0.5
+      A.RandomCrop:
+        p: 1.0
+        width: 224
+        height: 224
+
+model:
+  type: Resnet3D
+  args:
+    pretrained: True
+    num_classes: 101
+
+callbacks:
+  ModelCheckpoint:
+    every_n_epochs: 2
+    save_top_k: -1
+    verbose: True
+
+loss:
+  type: CrossEntropyLoss
+
+metrics:
+  - metric:
+      type: Accuracy
+  - metric:
+      type: Precision
+  - metric:
+      type: Recall
+
+hypes:
+  batch_size: 4
+  epochs: 100
+  lr: 0.0001
+
+optimizers:
+  AdamW:
+    scheduler:
+      type: ReduceLROnPlateau
+      args:
+        patience: 300
+        factor: 0.05
+        min_lr: 0.00002
+        verbose: True
+      monitor: validation/loss
+
+hardware:
+  accelerator: gpu
+  devices: 1
+
+loggers:
+  tensorboard:

@@ -1,43 +1,37 @@
 dataset:
   train:
-    type: CityScapesDataset
-    split: train
-    num_workers: 4
-    image_sz: &image_sz [512, 512]
-    root_path: &root_path Cityscapes/gtFine_trainvaltest
+    type: PROMISE12
+    num_workers: 6
+    image_sz: &image_sz [128, 128, 64]
+    root_path: path_to_data
     augment:
       A.HorizontalFlip:
         p: 0.5
   valid:
-    type: CityScapesDataset
-    split: val
-    num_workers: 4
+    type: PROMISE12
+    num_workers: 6
     image_sz: *image_sz
-    root_path: *root_path
+    root_path: path_to_data
 
 model:
-  type: UNet
+  type: VNet
 
   args:
-    in_channels: 3
-    out_channels: 19
+    in_channels: 1
+    out_channels: 2
 
 callbacks:
   ModelCheckpoint:
     every_n_epochs: 2
-    monitor: "validation/loss"
-    save_weights_only: True
     save_top_k: -1
     verbose: True
 
-
 losses:
   - loss:
-      type: CrossEntropyLoss
-      weights: 1
+      type: DiceLoss
 
 metric:
-  type: PixelAccuracy
+  type: CrossEntropyLoss
 
 hypes:
   batch_size: 6

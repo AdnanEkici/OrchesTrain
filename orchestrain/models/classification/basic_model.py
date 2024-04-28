@@ -5,8 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from orchestrain.models.base import ClassificationAdapter
+from orchestrain.registers.model_registry import model_registry
 
 
+@model_registry.register("BasicModel")
 class BasicModel(ClassificationAdapter):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
